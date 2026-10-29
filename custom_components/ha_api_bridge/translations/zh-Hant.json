@@ -1,0 +1,31 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "連線至遠端 Home Assistant",
+        "description": "輸入遠端 Home Assistant 網址與長期存取權杖。",
+        "data": {
+          "url": "遠端 Home Assistant URL",
+          "token": "長期存取權杖"
+        }
+      },
+      "select_entities": {
+        "title": "選擇 Climate Entity",
+        "description": "選取要同步至此 Home Assistant 的 Climate Entity。",
+        "data": {
+          "entity_ids": "Climate Entity"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "無法連線至遠端 Home Assistant。",
+      "invalid_auth": "遠端 Home Assistant 拒絕了此存取權杖。",
+      "unknown": "發生未預期的錯誤。",
+      "no_entities_selected": "請至少選擇一個 Climate Entity。"
+    },
+    "abort": {
+      "no_climate_entities": "遠端 Home Assistant 沒有可用的 Climate Entity。",
+      "unknown": "設定流程無法繼續。"
+    }
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Remote Home Assistant",
+        "description": "Enter the Remote Home Assistant base URL and a Long-Lived Access Token.",
+        "data": {
+          "url": "Remote Home Assistant URL",
+          "token": "Long-Lived Access Token"
+        }
+      },
+      "select_entities": {
+        "title": "Select climate entities",
+        "description": "Choose the climate entities to mirror in this Home Assistant instance.",
+        "data": {
+          "entity_ids": "Climate entities"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Unable to connect to Remote Home Assistant.",
+      "invalid_auth": "The access token was rejected.",
+      "unknown": "An unexpected error occurred.",
+      "no_entities_selected": "Select at least one climate entity."
+    },
+    "abort": {
+      "no_climate_entities": "Remote Home Assistant has no available climate entities.",
+      "unknown": "The configuration flow could not continue."
+    }
+  }
+}

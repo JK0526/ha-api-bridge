@@ -1,0 +1,22 @@
+"""Constants for HA API Bridge."""
+
+from typing import Final
+
+DOMAIN: Final = "ha_api_bridge"
+PLATFORMS: Final = ("climate",)
+
+CONF_URL: Final = "url"
+CONF_TOKEN: Final = "token"
+CONF_ENTITY_IDS: Final = "entity_ids"
+CONF_REMOTE_VERSION: Final = "remote_version"
+CONF_INSTANCE_ID: Final = "remote_instance_id"
+
+CONNECT_TIMEOUT: Final = 10
+AUTH_TIMEOUT: Final = 10
+REQUEST_TIMEOUT: Final = 10
+WS_HEARTBEAT: Final = 60
+
+RECONNECT_DELAYS: Final = (1, 2, 5, 10, 30, 60)
+
+ATTR_STATE: Final = "state"
+ATTR_ATTRIBUTES: Final = "attributes"
