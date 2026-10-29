@@ -7,12 +7,43 @@ from typing import Any
 
 import pytest
 from homeassistant.components.climate import ClimateEntityFeature, HVACMode
+from homeassistant.config_entries import SOURCE_USER
 
 from custom_components.ha_api_bridge.client import HAWebSocketClient
 from custom_components.ha_api_bridge.climate import RemoteClimateEntity
+from custom_components.ha_api_bridge.const import (
+    CONF_ENTITY_IDS,
+    CONF_TOKEN,
+    CONF_URL,
+    DOMAIN,
+)
 from tests.conftest import ENTITY_ID, TOKEN, MockRemoteHA
 
 pytestmark = pytest.mark.enable_socket
+
+
+async def _create_platform_proxy(hass: Any, remote_ha: MockRemoteHA) -> None:
+    """Create and set up a real config entry and Climate platform entity."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_USER},
+        data={CONF_URL: remote_ha.url, CONF_TOKEN: TOKEN},
+    )
+    assert result["type"] == "form"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_ENTITY_IDS: [ENTITY_ID]}
+    )
+    assert result["type"] == "create_entry"
+
+
+def _proxy_state(hass: Any) -> Any:
+    """Find the Climate state created by the integration platform."""
+    states = hass.states.async_all("climate")
+    return next(
+        state
+        for state in states
+        if state.attributes.get("friendly_name") == "Office AC"
+    )
 
 
 async def test_climate_mapping_and_non_optimistic_command(
@@ -49,6 +80,8 @@ async def test_climate_mapping_and_non_optimistic_command(
 
         await entity.async_set_temperature(temperature=24)
         assert entity.target_temperature == 25.0
+        await entity.async_turn_on()
+        await entity.async_set_temperature(target_temp_low=21, target_temp_high=25)
         call = next(
             item for item in remote_ha.requests if item["type"] == "call_service"
         )
@@ -64,12 +97,26 @@ async def test_climate_mapping_and_non_optimistic_command(
         calls = [item for item in remote_ha.requests if item["type"] == "call_service"]
         assert [item["service"] for item in calls] == [
             "set_temperature",
+            "turn_on",
+            "set_temperature",
             "set_hvac_mode",
             "set_fan_mode",
             "set_swing_mode",
             "set_preset_mode",
             "turn_off",
         ]
+        assert [item.get("service_data", {}) for item in calls] == [
+            {"temperature": 24},
+            {},
+            {"target_temp_low": 21, "target_temp_high": 25},
+            {"hvac_mode": "fan_only"},
+            {"fan_mode": "high"},
+            {"swing_mode": "vertical"},
+            {"preset_mode": "eco"},
+            {},
+        ]
+        assert all(item["domain"] == "climate" for item in calls)
+        assert all(item["target"] == {"entity_id": ENTITY_ID} for item in calls)
     finally:
         entity._remove_listener()
         await client.async_close()
@@ -166,3 +213,69 @@ async def test_missing_climate_attributes_are_not_fabricated(
     finally:
         entity._remove_listener()
         await client.async_close()
+
+
+@pytest.mark.parametrize("temperature_unit", [None, "unsupported-unit"])
+async def test_invalid_temperature_unit_is_safe_on_climate_platform(
+    hass: Any,
+    remote_ha: MockRemoteHA,
+    enable_custom_integrations: None,
+    temperature_unit: str | None,
+) -> None:
+    attributes = remote_ha.states[0]["attributes"]
+    attributes["temperature_unit"] = temperature_unit
+    attributes["current_temperature"] = 24
+    attributes["temperature"] = 25
+    attributes["target_temp_high"] = 27
+    attributes["target_temp_low"] = 23
+    await _create_platform_proxy(hass, remote_ha)
+
+    state = _proxy_state(hass)
+    assert state.state == "cool"
+    assert state.attributes.get("current_temperature") is None
+    assert state.attributes.get("target_temperature") is None
+    assert state.attributes.get("target_temp_high") is None
+    assert state.attributes.get("target_temp_low") is None
+    assert state.attributes.get("min_temp") is None
+    assert state.attributes.get("max_temp") is None
+    features = state.attributes.get("supported_features", 0)
+    assert not features & ClimateEntityFeature.TARGET_TEMPERATURE
+    assert not features & ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
+
+
+async def test_boolean_supported_features_disable_all_optional_features(
+    hass: Any,
+    remote_ha: MockRemoteHA,
+    enable_custom_integrations: None,
+) -> None:
+    remote_ha.states[0]["attributes"]["supported_features"] = True
+    await _create_platform_proxy(hass, remote_ha)
+
+    state = _proxy_state(hass)
+    assert state.attributes.get("supported_features", 0) == 0
+    assert state.attributes.get("target_temperature") is None
+    assert state.attributes.get("target_temp_high") is None
+    assert state.attributes.get("target_temp_low") is None
+    assert state.attributes.get("fan_mode") is None
+    assert state.attributes.get("preset_mode") is None
+    assert state.attributes.get("swing_mode") is None
+
+
+async def test_malformed_climate_modes_are_safe_on_climate_platform(
+    hass: Any,
+    remote_ha: MockRemoteHA,
+    enable_custom_integrations: None,
+) -> None:
+    attributes = remote_ha.states[0]["attributes"]
+    attributes["hvac_modes"] = ["off", None, True, 1, {}, ["heat"], "cool", "invalid"]
+    attributes["fan_mode"] = {}
+    attributes["preset_mode"] = 123
+    attributes["swing_mode"] = []
+    await _create_platform_proxy(hass, remote_ha)
+
+    state = _proxy_state(hass)
+    assert state.state == "cool"
+    assert state.attributes.get("fan_mode") is None
+    assert state.attributes.get("preset_mode") is None
+    assert state.attributes.get("swing_mode") is None
+    assert state.attributes["hvac_modes"] == ["off", "cool"]

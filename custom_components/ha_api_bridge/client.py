@@ -22,7 +22,6 @@ from .const import (
     CONNECT_TIMEOUT,
     RECONNECT_DELAYS,
     REQUEST_TIMEOUT,
-    WS_HEARTBEAT,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -53,9 +52,21 @@ StateListener = Callable[[], None]
 
 def websocket_url(base_url: str) -> str:
     """Convert a Home Assistant HTTP(S) base URL into its WebSocket URL."""
+    normalized = normalized_remote_url(base_url)
+    parsed = urlsplit(normalized)
+    path = parsed.path
+    if not path.endswith("/api/websocket"):
+        path = f"{path}/api/websocket"
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    return urlunsplit((scheme, parsed.netloc, path, "", ""))
+
+
+def normalized_remote_url(base_url: str) -> str:
+    """Return a stable, credential-free HTTP(S) base URL for config identity."""
     parsed = urlsplit(base_url.strip())
+    scheme = parsed.scheme.lower()
     if (
-        parsed.scheme not in ("http", "https")
+        scheme not in ("http", "https")
         or not parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
@@ -64,11 +75,21 @@ def websocket_url(base_url: str) -> str:
     ):
         raise ValueError("Enter an HTTP or HTTPS Home Assistant URL")
 
+    try:
+        port = parsed.port
+    except ValueError as err:
+        raise ValueError("Enter a valid Home Assistant URL") from err
+
+    hostname = parsed.hostname.lower()
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    default_port = 443 if scheme == "https" else 80
+    netloc = hostname if port in (None, default_port) else f"{hostname}:{port}"
+
     path = parsed.path.rstrip("/")
-    if not path.endswith("/api/websocket"):
-        path = f"{path}/api/websocket"
-    scheme = "wss" if parsed.scheme == "https" else "ws"
-    return urlunsplit((scheme, parsed.netloc, path, "", ""))
+    if path.endswith("/api/websocket"):
+        path = path[: -len("/api/websocket")].rstrip("/")
+    return urlunsplit((scheme, netloc, path, "", ""))
 
 
 class HAWebSocketClient:
@@ -91,6 +112,8 @@ class HAWebSocketClient:
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._reconnect_task: asyncio.Task[None] | None = None
+        self._start_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
         self._send_lock = asyncio.Lock()
         self._next_request_id = 0
         self._pending: dict[int, asyncio.Future[Any]] = {}
@@ -134,12 +157,11 @@ class HAWebSocketClient:
         ws: aiohttp.ClientWebSocketResponse | None = None
         try:
             async with asyncio.timeout(CONNECT_TIMEOUT):
-                ws = await self._session.ws_connect(
-                    self._url,
-                    heartbeat=WS_HEARTBEAT,
-                )
-            await self._authenticate(ws)
+                ws = await self._session.ws_connect(self._url)
             self._ws = ws
+            await self._authenticate(ws)
+            if self._stopping:
+                raise RemoteConnectionError("Remote HA client is stopping")
             self._states.clear()
             self._synced = False
             self._connected = True
@@ -150,10 +172,15 @@ class HAWebSocketClient:
         except asyncio.CancelledError:
             if ws is not None:
                 await ws.close()
+            if self._ws is ws:
+                self._ws = None
             raise
         except (TimeoutError, aiohttp.ClientError, RemoteHAError, ValueError) as err:
             if ws is not None:
                 await ws.close()
+            if self._ws is ws:
+                self._ws = None
+            self._connected = False
             if isinstance(err, RemoteHAError):
                 raise
             raise RemoteConnectionError(
@@ -201,20 +228,31 @@ class HAWebSocketClient:
 
     async def async_start(self) -> None:
         """Start the persistent selected-entity subscription and reconnect loop."""
-        if self._reconnect_task is not None:
-            raise RemoteConnectionError("The Remote HA client is already started")
-        self._stopping = False
-        await self.async_connect()
-        try:
-            await self._subscribe()
-        except (TimeoutError, RemoteHAError):
-            await self._close_socket()
-            raise
-        self._persistent = True
-        _LOGGER.info("Connected to Remote HA")
-        self._reconnect_task = self._hass.async_create_task(
-            self._reconnect_loop(), "ha_api_bridge websocket reconnect"
-        )
+        async with self._start_lock:
+            if (
+                self._reconnect_task is not None
+                or self._ws is not None
+                or self._reader_task is not None
+            ):
+                raise RemoteConnectionError("The Remote HA client is already started")
+            self._stopping = False
+            try:
+                await self.async_connect()
+                await self._subscribe()
+                if self._stopping:
+                    raise RemoteConnectionError("Remote HA client is stopping")
+            except asyncio.CancelledError:
+                await self.async_close()
+                raise
+            except Exception:
+                await self.async_close()
+                raise
+
+            self._persistent = True
+            _LOGGER.info("Connected to Remote HA")
+            self._reconnect_task = self._hass.async_create_task(
+                self._reconnect_loop(), "ha_api_bridge websocket reconnect"
+            )
 
     async def _subscribe(self) -> None:
         """Subscribe to only the selected remote entities."""
@@ -386,7 +424,8 @@ class HAWebSocketClient:
                     removed = attr_delta.get("-")
                     if isinstance(removed, list):
                         for attribute in removed:
-                            snapshot[ATTR_ATTRIBUTES].pop(attribute, None)
+                            if isinstance(attribute, str):
+                                snapshot[ATTR_ATTRIBUTES].pop(attribute, None)
                     if "+" not in attr_delta and "-" not in attr_delta:
                         snapshot[ATTR_ATTRIBUTES].update(attr_delta)
                 changed = True
@@ -480,30 +519,21 @@ class HAWebSocketClient:
             self._notify_listeners()
             if self._persistent:
                 _LOGGER.info("Disconnected from Remote HA")
-        if ws is not None and not ws.closed:
-            await ws.close()
-        if (
-            reader_task is not None
-            and reader_task is not asyncio.current_task()
-            and not reader_task.done()
-        ):
-            reader_task.cancel()
-            await asyncio.gather(reader_task, return_exceptions=True)
-
-    async def _close_socket(self) -> None:
-        """Close a failed startup connection."""
-        ws, self._ws = self._ws, None
-        self._connected = False
-        self._synced = False
-        self._subscription_id = None
-        self._states.clear()
-        if ws is not None and not ws.closed:
-            await ws.close()
-        reader_task, self._reader_task = self._reader_task, None
-        if reader_task is not None and not reader_task.done():
-            reader_task.cancel()
-            await asyncio.gather(reader_task, return_exceptions=True)
-        self._fail_pending(RemoteConnectionError("Remote HA connection closed"))
+        try:
+            if ws is not None and not ws.closed:
+                await ws.close()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.debug("Error closing Remote HA WebSocket", exc_info=True)
+        finally:
+            if (
+                reader_task is not None
+                and reader_task is not asyncio.current_task()
+                and not reader_task.done()
+            ):
+                reader_task.cancel()
+                await asyncio.gather(reader_task, return_exceptions=True)
 
     def _fail_pending(self, error: RemoteHAError) -> None:
         """Finish pending requests on shutdown."""
@@ -514,24 +544,38 @@ class HAWebSocketClient:
 
     async def async_close(self) -> None:
         """Unsubscribe and close tasks/socket cleanly."""
-        self._stopping = True
-        reconnect_task, self._reconnect_task = self._reconnect_task, None
-        if reconnect_task is not None and not reconnect_task.done():
-            reconnect_task.cancel()
-            await asyncio.gather(reconnect_task, return_exceptions=True)
-
-        if self._connected and self._subscription_id is not None:
+        async with self._close_lock:
+            self._stopping = True
+            reconnect_task, self._reconnect_task = self._reconnect_task, None
             try:
-                await self._request(
-                    {
-                        "type": "unsubscribe_events",
-                        "subscription": self._subscription_id,
-                    }
-                )
-            except (TimeoutError, RemoteHAError):
-                _LOGGER.debug(
-                    "Remote HA subscription could not be removed during shutdown"
-                )
+                if reconnect_task is not None and not reconnect_task.done():
+                    reconnect_task.cancel()
+                    await asyncio.gather(reconnect_task, return_exceptions=True)
 
-        await self._disconnect()
-        self._fail_pending(RemoteConnectionError("Remote HA client stopped"))
+                if self._connected and self._subscription_id is not None:
+                    try:
+                        await self._request(
+                            {
+                                "type": "unsubscribe_events",
+                                "subscription": self._subscription_id,
+                            }
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except (TimeoutError, RemoteHAError):
+                        _LOGGER.debug(
+                            "Remote HA subscription could not be removed "
+                            "during shutdown"
+                        )
+            finally:
+                try:
+                    await self._disconnect()
+                finally:
+                    self._fail_pending(
+                        RemoteConnectionError("Remote HA client stopped")
+                    )
+                    self._persistent = False
+                    self._listeners.clear()
+                    if reconnect_task is not None and not reconnect_task.done():
+                        reconnect_task.cancel()
+                        await asyncio.gather(reconnect_task, return_exceptions=True)

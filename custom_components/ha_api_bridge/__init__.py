@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
@@ -23,6 +25,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     try:
         await client.async_start()
+    except asyncio.CancelledError:
+        await client.async_close()
+        raise
     except RemoteHAError as err:
         await client.async_close()
         raise ConfigEntryNotReady("Unable to connect to Remote Home Assistant") from err
@@ -30,6 +35,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.runtime_data = client
     try:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except asyncio.CancelledError:
+        await client.async_close()
+        raise
     except Exception:
         await client.async_close()
         raise

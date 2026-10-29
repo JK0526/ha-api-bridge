@@ -15,6 +15,7 @@ from .client import (
     RemoteAuthError,
     RemoteConnectionError,
     RemoteHAError,
+    normalized_remote_url,
 )
 from .const import (
     CONF_ENTITY_IDS,
@@ -43,10 +44,13 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Check the URL/token and fetch climate choices."""
         errors: dict[str, str] = {}
         if user_input is not None:
-            url = user_input[CONF_URL].strip().rstrip("/")
+            url = user_input[CONF_URL]
             token = user_input[CONF_TOKEN].strip()
             client: HAWebSocketClient | None = None
             try:
+                url = normalized_remote_url(url)
+                await self.async_set_unique_id(url)
+                self._abort_if_unique_id_configured()
                 client = HAWebSocketClient(self.hass, url, token, [])
                 await client.async_connect()
                 states = await client.async_get_states()

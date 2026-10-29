@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -59,9 +60,19 @@ class MockRemoteHA:
         self.sockets: list[web.WebSocketResponse] = []
         self.subscription_ids: list[int] = []
         self.unsubscriptions: list[int] = []
+        self.subscriptions_by_socket: dict[int, int] = {}
         self.ignore_service_response = False
+        self.fail_service_response = False
+        self.ignore_subscribe_response = False
+        self.ignore_unsubscribe_response = False
+        self.ignore_get_states = False
+        self.invalid_get_states = False
+        self.delay_connect = False
+        self.connect_started = asyncio.Event()
+        self.release_connect = asyncio.Event()
+        self.delay_auth_response = False
         self.reject_auth = False
-        self.close_first_socket = False
+        self.close_after_subscribe_count: int | None = None
 
     @property
     def url(self) -> str:
@@ -71,7 +82,20 @@ class MockRemoteHA:
     @property
     def current_socket(self) -> web.WebSocketResponse:
         """Return the latest active socket."""
-        return self.sockets[-1]
+        return next(socket for socket in reversed(self.sockets) if not socket.closed)
+
+    @property
+    def active_sockets(self) -> list[web.WebSocketResponse]:
+        """Return open test server sockets."""
+        return [socket for socket in self.sockets if not socket.closed]
+
+    @property
+    def active_subscription_count(self) -> int:
+        """Return subscriptions attached to currently open server sockets."""
+        active_socket_ids = {id(socket) for socket in self.active_sockets}
+        return sum(
+            socket_id in active_socket_ids for socket_id in self.subscriptions_by_socket
+        )
 
     async def send(self, message: dict[str, Any]) -> None:
         """Send a server event to the latest active socket."""
@@ -88,7 +112,11 @@ async def remote_ha(
     async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
         nonlocal remote
         assert remote is not None
-        ws = web.WebSocketResponse(heartbeat=30)
+        if remote.delay_connect:
+            remote.connect_started.set()
+            await remote.release_connect.wait()
+            return web.Response(status=503)
+        ws = web.WebSocketResponse()
         await ws.prepare(request)
         remote.sockets.append(ws)
         await ws.send_json({"type": "auth_required", "ha_version": "2026.10.0"})
@@ -98,10 +126,11 @@ async def remote_ha(
             await ws.send_json({"type": "auth_invalid"})
             await ws.close()
             return ws
-        await ws.send_json({"type": "auth_ok", "ha_version": "2026.10.0"})
-        if remote.close_first_socket and len(remote.sockets) == 1:
-            await ws.close()
+        if remote.delay_auth_response:
+            async for _ in ws:
+                pass
             return ws
+        await ws.send_json({"type": "auth_ok", "ha_version": "2026.10.0"})
 
         async for message in ws:
             if message.type != web.WSMsgType.TEXT:
@@ -110,16 +139,21 @@ async def remote_ha(
             remote.requests.append(payload)
             command = payload["type"]
             if command == "get_states":
+                if remote.ignore_get_states:
+                    continue
                 await ws.send_json(
                     {
                         "id": payload["id"],
                         "type": "result",
                         "success": True,
-                        "result": remote.states,
+                        "result": None if remote.invalid_get_states else remote.states,
                     }
                 )
             elif command == "subscribe_entities":
                 remote.subscription_ids.append(payload["id"])
+                remote.subscriptions_by_socket[id(ws)] = payload["id"]
+                if remote.ignore_subscribe_response:
+                    continue
                 await ws.send_json(
                     {
                         "id": payload["id"],
@@ -128,6 +162,13 @@ async def remote_ha(
                         "result": None,
                     }
                 )
+                if (
+                    remote.close_after_subscribe_count is not None
+                    and len(remote.subscription_ids)
+                    >= remote.close_after_subscribe_count
+                ):
+                    await ws.close()
+                    return ws
                 await ws.send_json(
                     {
                         "id": payload["id"],
@@ -143,6 +184,13 @@ async def remote_ha(
                 )
             elif command == "unsubscribe_events":
                 remote.unsubscriptions.append(payload["subscription"])
+                if (
+                    remote.subscriptions_by_socket.get(id(ws))
+                    == payload["subscription"]
+                ):
+                    remote.subscriptions_by_socket.pop(id(ws), None)
+                if remote.ignore_unsubscribe_response:
+                    continue
                 await ws.send_json(
                     {
                         "id": payload["id"],
@@ -151,15 +199,18 @@ async def remote_ha(
                         "result": None,
                     }
                 )
-            elif command == "call_service" and not remote.ignore_service_response:
-                await ws.send_json(
-                    {
-                        "id": payload["id"],
-                        "type": "result",
-                        "success": True,
-                        "result": None,
-                    }
-                )
+            elif command == "call_service":
+                if remote.ignore_service_response:
+                    continue
+                response = {
+                    "id": payload["id"],
+                    "type": "result",
+                    "success": not remote.fail_service_response,
+                    "result": None,
+                }
+                if remote.fail_service_response:
+                    response["error"] = {"message": "Rejected by mock Remote HA"}
+                await ws.send_json(response)
         return ws
 
     app = web.Application()

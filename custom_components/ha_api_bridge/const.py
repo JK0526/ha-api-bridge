@@ -14,7 +14,6 @@ CONF_INSTANCE_ID: Final = "remote_instance_id"
 CONNECT_TIMEOUT: Final = 10
 AUTH_TIMEOUT: Final = 10
 REQUEST_TIMEOUT: Final = 10
-WS_HEARTBEAT: Final = 60
 
 RECONNECT_DELAYS: Final = (1, 2, 5, 10, 30, 60)
 

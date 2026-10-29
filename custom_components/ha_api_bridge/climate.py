@@ -10,6 +10,7 @@ from homeassistant.components.climate import (
     HVACMode,
 )
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -92,11 +93,23 @@ class RemoteClimateEntity(ClimateEntity):
         return None
 
     @classmethod
+    def _temperature_unit(cls, value: Any) -> str | None:
+        """Return a supported Home Assistant temperature unit, if present."""
+        if not isinstance(value, str):
+            return None
+        if value not in {unit.value for unit in UnitOfTemperature}:
+            return None
+        return value
+
+    @classmethod
     def _supported_features(cls, attributes: dict[str, Any]) -> ClimateEntityFeature:
         """Expose only remote features this proxy implements."""
+        raw_features = attributes.get("supported_features")
+        if isinstance(raw_features, bool) or not isinstance(raw_features, int):
+            return ClimateEntityFeature(0)
         try:
-            remote = ClimateEntityFeature(int(attributes.get("supported_features", 0)))
-        except (TypeError, ValueError):
+            remote = ClimateEntityFeature(raw_features)
+        except ValueError:
             return ClimateEntityFeature(0)
 
         supported = ClimateEntityFeature(0)
@@ -117,7 +130,7 @@ class RemoteClimateEntity(ClimateEntity):
         if (
             cls._number(attributes.get("min_temp")) is None
             or cls._number(attributes.get("max_temp")) is None
-            or not isinstance(attributes.get("temperature_unit"), str)
+            or cls._temperature_unit(attributes.get("temperature_unit")) is None
         ):
             supported &= ~(
                 ClimateEntityFeature.TARGET_TEMPERATURE
@@ -133,29 +146,29 @@ class RemoteClimateEntity(ClimateEntity):
 
     @staticmethod
     def _string_list(value: Any) -> list[str] | None:
-        if not isinstance(value, list):
+        if not isinstance(value, (list, tuple)):
             return None
         return [item for item in value if isinstance(item, str)]
 
     @staticmethod
     def _hvac_modes(value: Any) -> list[HVACMode] | None:
-        if not isinstance(value, list):
+        if not isinstance(value, (list, tuple)):
             return None
         modes: list[HVACMode] = []
         for item in value:
+            if not isinstance(item, str):
+                continue
             try:
                 modes.append(HVACMode(item))
-            except (ValueError, TypeError):
+            except ValueError:
                 continue
         return modes
 
     def _sync_from_remote(self) -> None:
         """Copy the latest snapshot to Home Assistant's climate backing fields.
 
-        The legacy ``_attr_*`` fields are still supported by the current Core
-        versions and are migrated to the native temperature fields by newer
-        Core versions. This keeps the integration compatible across that API
-        transition without inventing missing remote values.
+        Home Assistant 2026.10.3 uses the non-native Climate temperature fields.
+        Missing or invalid units suppress all numeric temperature attributes.
         """
         attributes = self._attributes or {}
         state = self._state
@@ -166,32 +179,51 @@ class RemoteClimateEntity(ClimateEntity):
             self._attr_hvac_mode = None
 
         self._attr_hvac_modes = self._hvac_modes(attributes.get("hvac_modes"))
-        self._attr_current_temperature = self._number(
-            attributes.get("current_temperature")
+        temperature_unit = self._temperature_unit(attributes.get("temperature_unit"))
+        self._attr_temperature_unit = temperature_unit
+        self._attr_current_temperature = (
+            self._number(attributes.get("current_temperature"))
+            if temperature_unit is not None
+            else None
         )
-        self._attr_native_current_temperature = self._attr_current_temperature
-        self._attr_target_temperature = self._number(attributes.get("temperature"))
-        self._attr_native_target_temperature = self._attr_target_temperature
-        self._attr_target_temperature_high = self._number(
-            attributes.get("target_temp_high")
+        self._attr_target_temperature = (
+            self._number(attributes.get("temperature"))
+            if temperature_unit is not None
+            else None
         )
-        self._attr_native_target_temperature_high = self._attr_target_temperature_high
-        self._attr_target_temperature_low = self._number(
-            attributes.get("target_temp_low")
+        self._attr_target_temperature_high = (
+            self._number(attributes.get("target_temp_high"))
+            if temperature_unit is not None
+            else None
         )
-        self._attr_native_target_temperature_low = self._attr_target_temperature_low
-        self._attr_temperature_unit = attributes.get("temperature_unit")
-        self._attr_native_temperature_unit = self._attr_temperature_unit
-        self._attr_min_temp = self._number(attributes.get("min_temp"))
-        self._attr_max_temp = self._number(attributes.get("max_temp"))
-        self._attr_target_temperature_step = self._number(
-            attributes.get("target_temp_step")
+        self._attr_target_temperature_low = (
+            self._number(attributes.get("target_temp_low"))
+            if temperature_unit is not None
+            else None
         )
-        self._attr_fan_mode = attributes.get("fan_mode")
+        self._attr_min_temp = (
+            self._number(attributes.get("min_temp"))
+            if temperature_unit is not None
+            else None
+        )
+        self._attr_max_temp = (
+            self._number(attributes.get("max_temp"))
+            if temperature_unit is not None
+            else None
+        )
+        self._attr_target_temperature_step = (
+            self._number(attributes.get("target_temp_step"))
+            if temperature_unit is not None
+            else None
+        )
+        fan_mode = attributes.get("fan_mode")
+        self._attr_fan_mode = fan_mode if isinstance(fan_mode, str) else None
         self._attr_fan_modes = self._string_list(attributes.get("fan_modes"))
-        self._attr_swing_mode = attributes.get("swing_mode")
+        swing_mode = attributes.get("swing_mode")
+        self._attr_swing_mode = swing_mode if isinstance(swing_mode, str) else None
         self._attr_swing_modes = self._string_list(attributes.get("swing_modes"))
-        self._attr_preset_mode = attributes.get("preset_mode")
+        preset_mode = attributes.get("preset_mode")
+        self._attr_preset_mode = preset_mode if isinstance(preset_mode, str) else None
         self._attr_preset_modes = self._string_list(attributes.get("preset_modes"))
         self._attr_supported_features = self._supported_features(attributes)
 
