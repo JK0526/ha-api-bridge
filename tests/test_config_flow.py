@@ -15,7 +15,6 @@ from custom_components.ha_api_bridge.client import HAWebSocketClient
 from custom_components.ha_api_bridge.const import (
     CONF_ENTITY_IDS,
     CONF_INSTANCE_ID,
-    CONF_REMOTE_VERSION,
     CONF_TOKEN,
     CONF_URL,
     DOMAIN,
@@ -26,7 +25,10 @@ pytestmark = pytest.mark.enable_socket
 
 
 async def test_config_flow_auth_and_create_entry(
-    hass: Any, remote_ha: MockRemoteHA, enable_custom_integrations: None
+    hass: Any,
+    remote_ha: MockRemoteHA,
+    enable_custom_integrations: None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     parsed_url = urlsplit(remote_ha.url)
     url_without_scheme = parsed_url.netloc
@@ -50,13 +52,22 @@ async def test_config_flow_auth_and_create_entry(
     assert entry.data[CONF_URL] == remote_ha.url
     assert entry.data[CONF_TOKEN] == TOKEN
     assert entry.data[CONF_ENTITY_IDS] == [ENTITY_ID]
-    assert entry.data[CONF_REMOTE_VERSION] == "2026.10.0"
+    assert "remote_version" not in entry.data
     assert entry.data[CONF_INSTANCE_ID]
     first_client = entry.runtime_data
+    assert set(first_client._listeners) == {ENTITY_ID}
+    original_first_close = first_client.async_close
+
+    async def verify_first_entity_removed() -> None:
+        assert first_client._listeners == {}
+        await original_first_close()
+
+    monkeypatch.setattr(first_client, "async_close", verify_first_entity_removed)
     assert await hass.config_entries.async_unload(entry.entry_id)
     assert not first_client.connected
     assert first_client._reader_task is None
     assert first_client._reconnect_task is None
+    assert first_client._listeners == {}
     assert len(remote_ha.sockets) == 2
     assert len(remote_ha.subscription_ids) == 1
 
@@ -78,7 +89,17 @@ async def test_config_flow_auth_and_create_entry(
     assert len(remote_ha.sockets) == 3
     assert len(remote_ha.subscription_ids) == 2
     assert remote_ha.unsubscriptions == remote_ha.subscription_ids[:1]
+    assert set(second_client._listeners) == {ENTITY_ID}
+    assert len(second_client._listeners[ENTITY_ID]) == 1
+    original_second_close = second_client.async_close
+
+    async def verify_second_entity_removed() -> None:
+        assert second_client._listeners == {}
+        await original_second_close()
+
+    monkeypatch.setattr(second_client, "async_close", verify_second_entity_removed)
     assert await hass.config_entries.async_unload(entry.entry_id)
+    assert second_client._listeners == {}
     assert remote_ha.unsubscriptions == remote_ha.subscription_ids
 
 

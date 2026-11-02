@@ -58,6 +58,7 @@ def compressed_state(state: dict[str, Any]) -> dict[str, Any]:
         "c": compressed_context,
         "lc": datetime.fromisoformat(state["last_changed"]).timestamp(),
         "lu": datetime.fromisoformat(state["last_updated"]).timestamp(),
+        "future_metadata": {"ignored": True},
     }
 
 

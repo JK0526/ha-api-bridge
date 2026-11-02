@@ -20,7 +20,6 @@ from .client import (
 from .const import (
     CONF_ENTITY_IDS,
     CONF_INSTANCE_ID,
-    CONF_REMOTE_VERSION,
     CONF_TOKEN,
     CONF_URL,
     DOMAIN,
@@ -35,7 +34,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         self._url: str | None = None
         self._token: str | None = None
-        self._version: str | None = None
         self._entities: dict[str, str] = {}
 
     async def async_step_user(
@@ -72,7 +70,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     return self.async_abort(reason="no_climate_entities")
                 self._url = url
                 self._token = token
-                self._version = client.ha_version
                 return await self.async_step_select_entities()
             except RemoteAuthError:
                 errors["base"] = "invalid_auth"
@@ -123,7 +120,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         CONF_URL: self._url,
                         CONF_TOKEN: self._token,
                         CONF_ENTITY_IDS: entity_ids,
-                        CONF_REMOTE_VERSION: self._version,
                         CONF_INSTANCE_ID: str(uuid.uuid4()),
                     },
                 )

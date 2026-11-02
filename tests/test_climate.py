@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from typing import Any
 
 import pytest
@@ -93,11 +92,11 @@ async def test_temperature_unit_resolution_and_supported_features(
 
     client = HAWebSocketClient(hass, remote_ha.url, TOKEN, [ENTITY_ID])
     await client.async_start()
-    entity = RemoteClimateEntity(client, "temperature-unit-test", ENTITY_ID)
     try:
         async with asyncio.timeout(1):
             while not client.synced:
                 await asyncio.sleep(0.01)
+        entity = RemoteClimateEntity(client, "temperature-unit-test", ENTITY_ID)
         assert client.remote_temperature_unit == remote_unit
         assert entity.temperature_unit == expected_unit
         if expected_unit is None:
@@ -120,7 +119,6 @@ async def test_temperature_unit_resolution_and_supported_features(
         assert entity.supported_features & ClimateEntityFeature.TURN_OFF
         assert entity.supported_features & ClimateEntityFeature.TURN_ON
     finally:
-        entity._remove_listener()
         await client.async_close()
 
 
@@ -264,43 +262,16 @@ async def test_client_command_waits_for_remote_subscribe_entities_update(
             await asyncio.sleep(0.01)
 
 
-async def test_debug_sync_diagnostics_redact_the_access_token(
-    hass: Any,
-    remote_ha: MockRemoteHA,
-    enable_custom_integrations: None,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Selected-entity DEBUG diagnostics never expose the access token."""
-    remote_ha.states[0]["attributes"]["fan_mode"] = TOKEN
-    caplog.set_level(logging.DEBUG)
-    await _create_platform_proxy(hass, remote_ha)
-
-    assert "RX subscribe_entities" in caplog.text
-    assert "Merged snapshot" in caplog.text
-    assert "Proxy write" in caplog.text
-    assert TOKEN not in caplog.text
-    diagnostic_records = [
-        record
-        for record in caplog.records
-        if any(
-            marker in record.getMessage()
-            for marker in ("RX subscribe_entities", "Merged snapshot", "Proxy write")
-        )
-    ]
-    assert diagnostic_records
-    assert all(record.levelno == logging.DEBUG for record in diagnostic_records)
-
-
 async def test_climate_mapping_and_non_optimistic_command(
     hass: Any, remote_ha: MockRemoteHA
 ) -> None:
     client = HAWebSocketClient(hass, remote_ha.url, TOKEN, [ENTITY_ID])
     await client.async_start()
-    entity = RemoteClimateEntity(client, "a-stable-entry-uuid", ENTITY_ID)
     try:
         async with asyncio.timeout(1):
             while not client.synced:
                 await asyncio.sleep(0.01)
+        entity = RemoteClimateEntity(client, "a-stable-entry-uuid", ENTITY_ID)
         assert entity.name == "Office AC"
         assert entity.hvac_mode == HVACMode.COOL
         assert entity.hvac_modes == [
@@ -363,7 +334,6 @@ async def test_climate_mapping_and_non_optimistic_command(
         assert all(item["domain"] == "climate" for item in calls)
         assert all(item["target"] == {"entity_id": ENTITY_ID} for item in calls)
     finally:
-        entity._remove_listener()
         await client.async_close()
 
 
@@ -372,11 +342,11 @@ async def test_unavailable_removed_and_unknown_states(
 ) -> None:
     client = HAWebSocketClient(hass, remote_ha.url, TOKEN, [ENTITY_ID])
     await client.async_start()
-    entity = RemoteClimateEntity(client, "a-stable-entry-uuid", ENTITY_ID)
     try:
         async with asyncio.timeout(1):
             while not client.synced:
                 await asyncio.sleep(0.01)
+        entity = RemoteClimateEntity(client, "a-stable-entry-uuid", ENTITY_ID)
         assert entity.available
         subscription_id = remote_ha.subscription_ids[0]
         await remote_ha.send(
@@ -427,7 +397,6 @@ async def test_unavailable_removed_and_unknown_states(
                 await asyncio.sleep(0.01)
         assert not entity.available
     finally:
-        entity._remove_listener()
         await client.async_close()
 
 
@@ -460,7 +429,6 @@ async def test_missing_climate_attributes_are_not_fabricated(
         assert not entity.supported_features & ClimateEntityFeature.SWING_MODE
         assert not entity.supported_features & ClimateEntityFeature.PRESET_MODE
     finally:
-        entity._remove_listener()
         await client.async_close()
 
 

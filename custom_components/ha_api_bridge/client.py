@@ -112,7 +112,6 @@ class HAWebSocketClient:
         self._url = websocket_url(base_url)
         self._token = token
         self.entity_ids = tuple(entity_ids)
-        self.ha_version: str | None = None
         self.remote_temperature_unit: str | None = None
 
         self._session = async_get_clientsession(hass)
@@ -126,7 +125,7 @@ class HAWebSocketClient:
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._subscription_id: int | None = None
         self._states: dict[str, dict[str, Any]] = {}
-        self._listeners: set[StateListener] = set()
+        self._listeners: dict[str, set[StateListener]] = {}
         self._connected = False
         self._synced = False
         self._stopping = False
@@ -147,19 +146,21 @@ class HAWebSocketClient:
         """Return the selected entities' latest complete snapshots."""
         return self._states
 
-    def add_listener(self, listener: StateListener) -> Callable[[], None]:
-        """Subscribe to connection or selected-state changes."""
-        self._listeners.add(listener)
+    def add_listener(
+        self, entity_id: str, listener: StateListener
+    ) -> Callable[[], None]:
+        """Subscribe to connection or selected-state changes for one entity."""
+        self._listeners.setdefault(entity_id, set()).add(listener)
 
         def remove_listener() -> None:
-            self._listeners.discard(listener)
+            listeners = self._listeners.get(entity_id)
+            if listeners is None:
+                return
+            listeners.discard(listener)
+            if not listeners:
+                self._listeners.pop(entity_id, None)
 
         return remove_listener
-
-    def redact_for_log(self, value: Any) -> str:
-        """Return a string representation with the access token removed."""
-        text = str(value)
-        return text.replace(self._token, "[redacted]") if self._token else text
 
     async def async_connect(self) -> None:
         """Connect and authenticate without starting automatic reconnection."""
@@ -180,7 +181,6 @@ class HAWebSocketClient:
             self._reader_task = self._hass.async_create_task(
                 self._reader(ws), "ha_api_bridge websocket reader"
             )
-            self._notify_listeners()
         except asyncio.CancelledError:
             if ws is not None:
                 await ws.close()
@@ -226,8 +226,6 @@ class HAWebSocketClient:
             raise RemoteAuthError("Remote HA rejected the access token")
         if result.get("type") != "auth_ok":
             raise RemoteConnectionError("Remote HA sent an invalid auth response")
-        version = result.get("ha_version")
-        self.ha_version = version if isinstance(version, str) else None
 
     async def async_get_states(self) -> list[dict[str, Any]]:
         """Get initial states during the config flow only."""
@@ -334,6 +332,7 @@ class HAWebSocketClient:
                 await ws.send_json(payload)
             return await asyncio.wait_for(future, timeout=REQUEST_TIMEOUT)
         except TimeoutError as err:
+            await self._mark_request_timeout(ws)
             raise RemoteRequestTimeout(
                 f"Remote HA did not respond to {message.get('type')} in time"
             ) from err
@@ -343,6 +342,18 @@ class HAWebSocketClient:
             self._pending.pop(request_id, None)
             if not future.done():
                 future.cancel()
+
+    async def _mark_request_timeout(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """Close the unhealthy socket so the existing reconnect loop can recover."""
+        if ws is not self._ws or not self._connected or self._stopping:
+            return
+        self._mark_disconnected()
+        try:
+            await ws.close()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.debug("Error closing timed-out Remote HA WebSocket", exc_info=True)
 
     async def _reader(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         """Read every server message from the socket in this single task."""
@@ -419,12 +430,12 @@ class HAWebSocketClient:
 
     def _apply_entities_event(self, event: dict[str, Any]) -> None:
         """Expand compact additions/deltas/removals into complete snapshots."""
-        changed = not self._synced
+        initial_snapshot = not self._synced
+        changed = initial_snapshot
         touched_entities: set[str] = set()
         added = event.get("a")
         if isinstance(added, dict):
             for entity_id, compact in added.items():
-                self._log_entity_payload(entity_id, "a", compact)
                 if entity_id not in self.entity_ids or not isinstance(compact, dict):
                     continue
                 attributes = compact.get("a")
@@ -434,13 +445,6 @@ class HAWebSocketClient:
                     if isinstance(attributes, dict)
                     else {},
                 }
-                for compressed_key, state_key in (
-                    ("c", "context"),
-                    ("lc", "last_changed"),
-                    ("lu", "last_updated"),
-                ):
-                    if compressed_key in compact:
-                        snapshot[state_key] = compact[compressed_key]
                 self._states[entity_id] = snapshot
                 touched_entities.add(entity_id)
                 changed = True
@@ -448,7 +452,6 @@ class HAWebSocketClient:
         deltas = event.get("c")
         if isinstance(deltas, dict):
             for entity_id, delta in deltas.items():
-                self._log_entity_payload(entity_id, "c", delta)
                 snapshot = self._states.get(entity_id)
                 if (
                     entity_id not in self.entity_ids
@@ -457,33 +460,15 @@ class HAWebSocketClient:
                 ):
                     continue
                 additions = delta.get("+")
+                entity_changed = False
                 if isinstance(additions, dict):
                     if "s" in additions:
                         snapshot[ATTR_STATE] = additions["s"]
-                    for compressed_key, state_key in (
-                        ("lc", "last_changed"),
-                        ("lu", "last_updated"),
-                    ):
-                        if compressed_key in additions:
-                            snapshot[state_key] = additions[compressed_key]
-                    if "c" in additions:
-                        context = additions["c"]
-                        existing_context = snapshot.get("context")
-                        if isinstance(context, dict):
-                            merged_context = (
-                                {"id": existing_context}
-                                if isinstance(existing_context, str)
-                                else dict(existing_context)
-                                if isinstance(existing_context, dict)
-                                else {}
-                            )
-                            merged_context.update(context)
-                            snapshot["context"] = merged_context
-                        else:
-                            snapshot["context"] = context
+                        entity_changed = True
                     attribute_additions = additions.get("a")
-                    if isinstance(attribute_additions, dict):
+                    if isinstance(attribute_additions, dict) and attribute_additions:
                         snapshot[ATTR_ATTRIBUTES].update(attribute_additions)
+                        entity_changed = True
 
                 removals = delta.get("-")
                 if isinstance(removals, dict):
@@ -491,15 +476,17 @@ class HAWebSocketClient:
                     if isinstance(removed_attributes, list):
                         for attribute in removed_attributes:
                             if isinstance(attribute, str):
-                                snapshot[ATTR_ATTRIBUTES].pop(attribute, None)
+                                if attribute in snapshot[ATTR_ATTRIBUTES]:
+                                    snapshot[ATTR_ATTRIBUTES].pop(attribute)
+                                    entity_changed = True
 
-                touched_entities.add(entity_id)
-                changed = True
+                if entity_changed:
+                    touched_entities.add(entity_id)
+                    changed = True
 
         removed_ids = event.get("r")
         if isinstance(removed_ids, list):
             for entity_id in removed_ids:
-                self._log_entity_payload(entity_id, "r", [entity_id])
                 if (
                     entity_id in self.entity_ids
                     and self._states.pop(entity_id, None) is not None
@@ -508,49 +495,24 @@ class HAWebSocketClient:
                     changed = True
 
         self._synced = True
-        for entity_id in touched_entities:
-            snapshot = self._states.get(entity_id)
-            self._log_merged_snapshot(entity_id, snapshot)
         if changed:
-            self._notify_listeners()
+            self._notify_listeners(None if initial_snapshot else touched_entities)
 
-    def _log_entity_payload(
-        self, entity_id: str, event_type: str, payload: Any
-    ) -> None:
-        """Log selected compressed payloads at DEBUG while redacting the token."""
-        if entity_id not in self.entity_ids or not _LOGGER.isEnabledFor(logging.DEBUG):
-            return
-        raw_payload = self.redact_for_log(
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        )
-        _LOGGER.debug(
-            "RX subscribe_entities: entity_id=%s event type=%s "
-            "raw compressed entity payload=%s",
-            entity_id,
-            event_type,
-            raw_payload,
-        )
-
-    def _log_merged_snapshot(
-        self, entity_id: str, snapshot: dict[str, Any] | None
-    ) -> None:
-        """Log selected merged state and attributes at DEBUG."""
-        if not _LOGGER.isEnabledFor(logging.DEBUG):
-            return
-        state = snapshot.get(ATTR_STATE) if snapshot else None
-        attributes = snapshot.get(ATTR_ATTRIBUTES) if snapshot else None
-        raw_snapshot = self.redact_for_log(
-            json.dumps(
-                {"state": state, "attributes": attributes},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        )
-        _LOGGER.debug("Merged snapshot: entity_id=%s %s", entity_id, raw_snapshot)
-
-    def _notify_listeners(self) -> None:
+    def _notify_listeners(self, entity_ids: set[str] | None = None) -> None:
         """Notify proxy entities without doing network I/O."""
-        for listener in tuple(self._listeners):
+        if entity_ids is None:
+            listeners = tuple(
+                listener
+                for entity_listeners in self._listeners.values()
+                for listener in entity_listeners
+            )
+        else:
+            listeners = tuple(
+                listener
+                for entity_id in entity_ids
+                for listener in self._listeners.get(entity_id, ())
+            )
+        for listener in listeners:
             try:
                 listener()
             except Exception:

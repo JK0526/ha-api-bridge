@@ -63,8 +63,8 @@ async def test_auth_subscribe_delta_service_and_shutdown(
         async with asyncio.timeout(1):
             while not client.synced:
                 await asyncio.sleep(0.01)
-        assert client.ha_version == "2026.10.0"
         assert client.states[ENTITY_ID]["state"] == "cool"
+        assert set(client.states[ENTITY_ID]) == {"state", "attributes"}
         assert client.remote_temperature_unit == "°C"
         assert [item["type"] for item in remote_ha.requests[:2]] == [
             "get_config",
@@ -78,10 +78,6 @@ async def test_auth_subscribe_delta_service_and_shutdown(
             item for item in remote_ha.requests if item["type"] == "subscribe_entities"
         )
         assert subscribe["entity_ids"] == [ENTITY_ID]
-        assert client.states[ENTITY_ID]["context"] == "test-context"
-        assert client.states[ENTITY_ID]["last_changed"]
-        assert client.states[ENTITY_ID]["last_updated"]
-
         before = client.states[ENTITY_ID]["attributes"]["temperature"]
         await client.async_call_service(
             ENTITY_ID, "set_temperature", {"temperature": 24}
@@ -130,6 +126,7 @@ async def test_ha_2026_10_subscribe_entities_payloads_merge_and_notify(
     client = HAWebSocketClient(hass, remote_ha.url, TOKEN, [ENTITY_ID])
     notifications: list[dict[str, Any]] = []
     remove_listener = client.add_listener(
+        ENTITY_ID,
         lambda: notifications.append(
             {
                 "state": client.states.get(ENTITY_ID, {}).get("state"),
@@ -137,7 +134,7 @@ async def test_ha_2026_10_subscribe_entities_payloads_merge_and_notify(
                     client.states.get(ENTITY_ID, {}).get("attributes", {})
                 ),
             }
-        )
+        ),
     )
     await client.async_start()
     try:
@@ -148,9 +145,7 @@ async def test_ha_2026_10_subscribe_entities_payloads_merge_and_notify(
         snapshot = client.states[ENTITY_ID]
         assert snapshot["state"] == "cool"
         assert snapshot["attributes"]["temperature"] == 25.0
-        assert snapshot["context"] == "test-context"
-        assert snapshot["last_changed"]
-        assert snapshot["last_updated"]
+        assert set(snapshot) == {"state", "attributes"}
 
         subscription_id = remote_ha.subscription_ids[0]
         await remote_ha.send(
@@ -182,6 +177,8 @@ async def test_ha_2026_10_subscribe_entities_payloads_merge_and_notify(
                                 "s": "heat",
                                 "c": {"id": "changed-context"},
                                 "lc": 1793232001.0,
+                                "lu": 1793232002.0,
+                                "future_metadata": {"ignored": True},
                             }
                         }
                     }
@@ -191,9 +188,7 @@ async def test_ha_2026_10_subscribe_entities_payloads_merge_and_notify(
         async with asyncio.timeout(1):
             while client.states[ENTITY_ID]["state"] != "heat":
                 await asyncio.sleep(0.01)
-        assert client.states[ENTITY_ID]["context"] == {
-            "id": "changed-context",
-        }
+        assert set(client.states[ENTITY_ID]) == {"state", "attributes"}
         assert notifications[-1]["state"] == "heat"
 
         await remote_ha.send(
@@ -241,19 +236,127 @@ async def test_invalid_auth(hass: Any, remote_ha: MockRemoteHA) -> None:
     assert remote_ha.auth_messages[0]["access_token"] == TOKEN
 
 
-async def test_request_timeout_does_not_disconnect(
+async def test_request_timeout_reconnects_without_retrying_command(
     hass: Any, remote_ha: MockRemoteHA, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     remote_ha.ignore_service_response = True
-    monkeypatch.setattr(client_module, "REQUEST_TIMEOUT", 0.02)
+    monkeypatch.setattr(client_module, "RECONNECT_DELAYS", (0.05,))
     client = HAWebSocketClient(hass, remote_ha.url, TOKEN, [ENTITY_ID])
     await client.async_start()
+    entity = RemoteClimateEntity(client, "a-stable-entry-uuid", ENTITY_ID)
+    async with asyncio.timeout(1):
+        while not client.synced:
+            await asyncio.sleep(0.01)
+    old_socket = remote_ha.current_socket
+    monkeypatch.setattr(client_module, "REQUEST_TIMEOUT", 0.02)
     try:
         with pytest.raises(RemoteRequestTimeout):
             await client.async_call_service(ENTITY_ID, "turn_off")
+        async with asyncio.timeout(1):
+            while not old_socket.closed:
+                await asyncio.sleep(0.005)
+        assert not client.connected
+        assert not entity.available
+        assert client._pending == {}
+        assert sum(item["type"] == "call_service" for item in remote_ha.requests) == 1
+
+        async with asyncio.timeout(2):
+            while len(remote_ha.subscription_ids) < 2 or not entity.available:
+                await asyncio.sleep(0.01)
+        assert old_socket.closed
         assert client.connected
+        assert remote_ha.active_sockets == [remote_ha.current_socket]
+        assert remote_ha.active_subscription_count == 1
+        assert len(remote_ha.subscription_ids) == 2
+        assert client._reader_task is not None and not client._reader_task.done()
+        assert client._reconnect_task is not None and not client._reconnect_task.done()
+        assert client._pending == {}
+        assert sum(item["type"] == "call_service" for item in remote_ha.requests) == 1
     finally:
         await client.async_close()
+    assert remote_ha.active_sockets == []
+    assert client._listeners == {}
+
+
+async def test_listeners_are_entity_specific_and_removed_on_cleanup(
+    hass: Any, remote_ha: MockRemoteHA, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(client_module, "RECONNECT_DELAYS", (0.01,))
+    second_entity_id = "climate.guest"
+    second_state = remote_ha.states[0].copy()
+    second_state["entity_id"] = second_entity_id
+    second_state["attributes"] = {
+        **remote_ha.states[0]["attributes"],
+        "friendly_name": "Guest AC",
+    }
+    remote_ha.states.append(second_state)
+    client = HAWebSocketClient(
+        hass, remote_ha.url, TOKEN, [ENTITY_ID, second_entity_id]
+    )
+    counts = {ENTITY_ID: 0, second_entity_id: 0}
+    remove_first = client.add_listener(
+        ENTITY_ID, lambda: counts.__setitem__(ENTITY_ID, counts[ENTITY_ID] + 1)
+    )
+    remove_second = client.add_listener(
+        second_entity_id,
+        lambda: counts.__setitem__(second_entity_id, counts[second_entity_id] + 1),
+    )
+    await client.async_start()
+    try:
+        async with asyncio.timeout(1):
+            while not client.synced:
+                await asyncio.sleep(0.01)
+        initial_counts = counts.copy()
+        subscription_id = remote_ha.subscription_ids[0]
+        await remote_ha.send(
+            {
+                "id": subscription_id,
+                "type": "event",
+                "event": {"c": {ENTITY_ID: {"+": {"a": {"temperature": 24}}}}},
+            }
+        )
+        async with asyncio.timeout(1):
+            while counts[ENTITY_ID] != initial_counts[ENTITY_ID] + 1:
+                await asyncio.sleep(0.01)
+        assert counts[second_entity_id] == initial_counts[second_entity_id]
+
+        await remote_ha.current_socket.close()
+        async with asyncio.timeout(1):
+            while client.connected:
+                await asyncio.sleep(0.01)
+        assert counts == {
+            ENTITY_ID: initial_counts[ENTITY_ID] + 2,
+            second_entity_id: initial_counts[second_entity_id] + 1,
+        }
+        async with asyncio.timeout(2):
+            while len(remote_ha.subscription_ids) < 2 or not client.synced:
+                await asyncio.sleep(0.01)
+        assert counts == {
+            ENTITY_ID: initial_counts[ENTITY_ID] + 3,
+            second_entity_id: initial_counts[second_entity_id] + 2,
+        }
+
+        remove_second()
+        before = counts[second_entity_id]
+        await remote_ha.send(
+            {
+                "id": remote_ha.subscription_ids[-1],
+                "type": "event",
+                "event": {"c": {second_entity_id: {"+": {"a": {"temperature": 24}}}}},
+            }
+        )
+        await asyncio.sleep(0.02)
+        assert counts[second_entity_id] == before
+    finally:
+        remove_first()
+        remove_second()
+        await client.async_close()
+    assert client._listeners == {}
+    assert client._pending == {}
+    assert client._reader_task is None
+    assert client._reconnect_task is None
+    assert remote_ha.active_sockets == []
+    assert remote_ha.active_subscription_count == 0
 
 
 async def test_reconnect_resubscribes_after_disconnect(
@@ -282,7 +385,6 @@ async def test_reconnect_resubscribes_after_disconnect(
         assert client._reader_task is not None and not client._reader_task.done()
         assert client.states[ENTITY_ID]["state"] == "cool"
     finally:
-        entity._remove_listener()
         await client.async_close()
 
 
@@ -362,6 +464,41 @@ async def test_unload_clears_pending_service_and_socket(
         assert remote_ha.active_sockets == []
         await client._disconnect()
         await client._disconnect()
+    finally:
+        if not request.done():
+            request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
+        await client.async_close()
+
+
+async def test_timeout_racing_with_unload_cleans_transport_once(
+    hass: Any, remote_ha: MockRemoteHA, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote_ha.ignore_service_response = True
+    remote_ha.ignore_unsubscribe_response = True
+    monkeypatch.setattr(client_module, "REQUEST_TIMEOUT", 0.05)
+    monkeypatch.setattr(client_module, "RECONNECT_DELAYS", (0.01,))
+    client = HAWebSocketClient(hass, remote_ha.url, TOKEN, [ENTITY_ID])
+    await client.async_start()
+    request = asyncio.create_task(client.async_call_service(ENTITY_ID, "turn_off"))
+    try:
+        async with asyncio.timeout(1):
+            while not any(
+                item["type"] == "call_service" for item in remote_ha.requests
+            ):
+                await asyncio.sleep(0.005)
+        await client.async_close()
+        with pytest.raises((RemoteConnectionError, RemoteRequestTimeout)):
+            await request
+        await asyncio.sleep(0.03)
+        assert client._pending == {}
+        assert client._ws is None
+        assert client._reader_task is None
+        assert client._reconnect_task is None
+        assert remote_ha.active_sockets == []
+        assert remote_ha.active_subscription_count == 0
+        assert len(remote_ha.sockets) == 1
+        assert sum(item["type"] == "call_service" for item in remote_ha.requests) == 1
     finally:
         if not request.done():
             request.cancel()

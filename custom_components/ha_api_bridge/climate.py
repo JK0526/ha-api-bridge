@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import logging
+from collections.abc import Callable
 from typing import Any
 
 from homeassistant.components.climate import (
@@ -22,8 +22,6 @@ from .const import (
     CONF_ENTITY_IDS,
     CONF_INSTANCE_ID,
 )
-
-_LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
@@ -50,8 +48,16 @@ class RemoteClimateEntity(ClimateEntity):
         self._client = client
         self._remote_entity_id = remote_entity_id
         self._attr_unique_id = f"{instance_id}:{remote_entity_id}"
+        self._remove_listener: Callable[[], None] | None = None
         self._sync_from_remote()
-        self._remove_listener = client.add_listener(self._handle_update)
+
+    async def async_added_to_hass(self) -> None:
+        """Listen for this remote entity after Home Assistant adds the proxy."""
+        self._remove_listener = self._client.add_listener(
+            self._remote_entity_id, self._handle_update
+        )
+        self._sync_from_remote()
+        await super().async_added_to_hass()
 
     @property
     def name(self) -> str | None:
@@ -241,30 +247,15 @@ class RemoteClimateEntity(ClimateEntity):
     @callback
     def _handle_update(self) -> None:
         self._sync_from_remote()
-        _LOGGER.debug("Proxy notification: entity_id=%s", self._remote_entity_id)
         if self.hass is None or self.entity_id is None:
             return
         self.async_write_ha_state()
 
-    @callback
-    def async_write_ha_state(self) -> None:
-        """Write the proxy state and log the mirrored Climate properties."""
-        _LOGGER.debug(
-            "Proxy write: entity_id=%s hvac_mode=%s temperature=%s "
-            "current_temperature=%s fan_mode=%s swing_mode=%s available=%s",
-            self._remote_entity_id,
-            self._client.redact_for_log(self.hvac_mode),
-            self._client.redact_for_log(self.target_temperature),
-            self._client.redact_for_log(self.current_temperature),
-            self._client.redact_for_log(self.fan_mode),
-            self._client.redact_for_log(self.swing_mode),
-            self._client.redact_for_log(self.available),
-        )
-        super().async_write_ha_state()
-
     async def async_will_remove_from_hass(self) -> None:
         """Drop the client listener when this proxy is removed."""
-        self._remove_listener()
+        if self._remove_listener is not None:
+            self._remove_listener()
+            self._remove_listener = None
         await super().async_will_remove_from_hass()
 
     async def async_turn_on(self) -> None:
