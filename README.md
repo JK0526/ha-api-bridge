@@ -1,5 +1,7 @@
 # HA API Bridge
 
+版本：v0.1.0-beta1
+
 Home Assistant 到 Home Assistant 的 Climate Entity Bridge。Remote HA 透過官方 WebSocket API 推送狀態；控制命令也經由同一條連線送回 Remote HA。
 
 ## 安裝與設定

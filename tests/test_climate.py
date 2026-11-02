@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from homeassistant.components.climate import ClimateEntityFeature, HVACMode
 from homeassistant.config_entries import SOURCE_USER
+from homeassistant.helpers.entity_platform import async_get_platforms
 
 from custom_components.ha_api_bridge.client import HAWebSocketClient
 from custom_components.ha_api_bridge.climate import RemoteClimateEntity
@@ -44,6 +45,125 @@ def _proxy_state(hass: Any) -> Any:
         state
         for state in states
         if state.attributes.get("friendly_name") == "Office AC"
+    )
+
+
+def _proxy_entity(hass: Any) -> RemoteClimateEntity:
+    """Find the live RemoteClimateEntity for its public Climate properties."""
+    platforms = async_get_platforms(hass, DOMAIN)
+    return next(
+        entity
+        for platform in platforms
+        for entity in platform.entities.values()
+        if isinstance(entity, RemoteClimateEntity)
+    )
+
+
+@pytest.mark.parametrize(
+    ("entity_unit", "remote_unit", "expected_unit"),
+    [
+        ("°F", "°C", "°F"),
+        (None, "°C", "°C"),
+        (None, "°F", "°F"),
+        (None, None, None),
+        ("unsupported-unit", "°F", "°F"),
+        ("unsupported-unit", "unsupported-unit", None),
+    ],
+)
+async def test_temperature_unit_resolution_and_supported_features(
+    hass: Any,
+    remote_ha: MockRemoteHA,
+    entity_unit: str | None,
+    remote_unit: str | None,
+    expected_unit: str | None,
+) -> None:
+    """Resolve the entity unit first, then Remote HA's configured unit."""
+    attributes = remote_ha.states[0]["attributes"]
+    attributes["current_temperature"] = 27
+    attributes["temperature"] = 27
+    attributes["min_temp"] = 16
+    attributes["max_temp"] = 30
+    attributes["target_temp_step"] = 1
+    attributes["supported_features"] = 393
+    if entity_unit is None:
+        attributes.pop("temperature_unit")
+    else:
+        attributes["temperature_unit"] = entity_unit
+    remote_ha.unit_system_temperature = remote_unit
+
+    client = HAWebSocketClient(hass, remote_ha.url, TOKEN, [ENTITY_ID])
+    await client.async_start()
+    entity = RemoteClimateEntity(client, "temperature-unit-test", ENTITY_ID)
+    try:
+        async with asyncio.timeout(1):
+            while not client.synced:
+                await asyncio.sleep(0.01)
+        assert client.remote_temperature_unit == remote_unit
+        assert entity.temperature_unit == expected_unit
+        if expected_unit is None:
+            assert entity.target_temperature is None
+            assert entity.current_temperature is None
+            assert entity.min_temp is None
+            assert entity.max_temp is None
+            assert entity.target_temperature_step is None
+            assert (
+                not entity.supported_features & ClimateEntityFeature.TARGET_TEMPERATURE
+            )
+        else:
+            assert entity.target_temperature == 27
+            assert entity.current_temperature == 27
+            assert entity.min_temp == 16
+            assert entity.max_temp == 30
+            assert entity.target_temperature_step == 1
+            assert entity.supported_features & ClimateEntityFeature.TARGET_TEMPERATURE
+        assert entity.supported_features & ClimateEntityFeature.FAN_MODE
+        assert entity.supported_features & ClimateEntityFeature.TURN_OFF
+        assert entity.supported_features & ClimateEntityFeature.TURN_ON
+    finally:
+        entity._remove_listener()
+        await client.async_close()
+
+
+async def test_unit_fallback_writes_temperature_state_with_feature_393(
+    hass: Any,
+    remote_ha: MockRemoteHA,
+    enable_custom_integrations: None,
+) -> None:
+    """A Celsius fallback writes valid Climate values and keeps feature 393."""
+    attributes = remote_ha.states[0]["attributes"]
+    attributes.pop("temperature_unit")
+    attributes.update(
+        {
+            "current_temperature": 27,
+            "temperature": 27,
+            "min_temp": 16,
+            "max_temp": 30,
+            "target_temp_step": 1,
+            "supported_features": 393,
+        }
+    )
+    remote_ha.unit_system_temperature = "°C"
+    await _create_platform_proxy(hass, remote_ha)
+
+    async with asyncio.timeout(1):
+        while _proxy_state(hass).attributes.get("temperature") != 27:
+            await asyncio.sleep(0.01)
+    entity = _proxy_entity(hass)
+    state = _proxy_state(hass)
+    assert entity.temperature_unit == "°C"
+    assert entity.target_temperature == 27
+    assert entity.current_temperature == 27
+    assert entity.min_temp == 16
+    assert entity.max_temp == 30
+    assert entity.target_temperature_step == 1
+    assert state.attributes["temperature"] == 27
+    assert state.attributes["current_temperature"] == 27
+    assert state.attributes["min_temp"] == 16
+    assert state.attributes["max_temp"] == 30
+    assert state.attributes["target_temp_step"] == 1
+    assert state.attributes["supported_features"] == 393
+    assert state.attributes["supported_features"] & int(
+        ClimateEntityFeature.TARGET_TEMPERATURE
     )
 
 
@@ -254,6 +374,9 @@ async def test_unavailable_removed_and_unknown_states(
     await client.async_start()
     entity = RemoteClimateEntity(client, "a-stable-entry-uuid", ENTITY_ID)
     try:
+        async with asyncio.timeout(1):
+            while not client.synced:
+                await asyncio.sleep(0.01)
         assert entity.available
         subscription_id = remote_ha.subscription_ids[0]
         await remote_ha.send(
@@ -311,6 +434,7 @@ async def test_unavailable_removed_and_unknown_states(
 async def test_missing_climate_attributes_are_not_fabricated(
     hass: Any, remote_ha: MockRemoteHA
 ) -> None:
+    remote_ha.unit_system_temperature = None
     state = remote_ha.states[0]
     state["attributes"].pop("temperature")
     state["attributes"].pop("temperature_unit")
@@ -347,6 +471,7 @@ async def test_invalid_temperature_unit_is_safe_on_climate_platform(
     enable_custom_integrations: None,
     temperature_unit: str | None,
 ) -> None:
+    remote_ha.unit_system_temperature = None
     attributes = remote_ha.states[0]["attributes"]
     attributes["temperature_unit"] = temperature_unit
     attributes["current_temperature"] = 24

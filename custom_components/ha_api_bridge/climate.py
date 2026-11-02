@@ -105,7 +105,9 @@ class RemoteClimateEntity(ClimateEntity):
         return value
 
     @classmethod
-    def _supported_features(cls, attributes: dict[str, Any]) -> ClimateEntityFeature:
+    def _supported_features(
+        cls, attributes: dict[str, Any], temperature_unit: str | None
+    ) -> ClimateEntityFeature:
         """Expose only remote features this proxy implements."""
         raw_features = attributes.get("supported_features")
         if isinstance(raw_features, bool) or not isinstance(raw_features, int):
@@ -133,7 +135,7 @@ class RemoteClimateEntity(ClimateEntity):
         if (
             cls._number(attributes.get("min_temp")) is None
             or cls._number(attributes.get("max_temp")) is None
-            or cls._temperature_unit(attributes.get("temperature_unit")) is None
+            or temperature_unit is None
         ):
             supported &= ~(
                 ClimateEntityFeature.TARGET_TEMPERATURE
@@ -170,8 +172,8 @@ class RemoteClimateEntity(ClimateEntity):
     def _sync_from_remote(self) -> None:
         """Copy the latest snapshot to Home Assistant's climate backing fields.
 
-        Home Assistant 2026.10.3 uses the non-native Climate temperature fields.
-        Missing or invalid units suppress all numeric temperature attributes.
+        Prefer the entity's unit, then use Remote HA's configured unit system.
+        Missing or invalid units suppress numeric temperature attributes.
         """
         attributes = self._attributes or {}
         state = self._state
@@ -183,6 +185,10 @@ class RemoteClimateEntity(ClimateEntity):
 
         self._attr_hvac_modes = self._hvac_modes(attributes.get("hvac_modes"))
         temperature_unit = self._temperature_unit(attributes.get("temperature_unit"))
+        if temperature_unit is None:
+            temperature_unit = self._temperature_unit(
+                self._client.remote_temperature_unit
+            )
         self._attr_temperature_unit = temperature_unit
         self._attr_current_temperature = (
             self._number(attributes.get("current_temperature"))
@@ -228,7 +234,9 @@ class RemoteClimateEntity(ClimateEntity):
         preset_mode = attributes.get("preset_mode")
         self._attr_preset_mode = preset_mode if isinstance(preset_mode, str) else None
         self._attr_preset_modes = self._string_list(attributes.get("preset_modes"))
-        self._attr_supported_features = self._supported_features(attributes)
+        self._attr_supported_features = self._supported_features(
+            attributes, temperature_unit
+        )
 
     @callback
     def _handle_update(self) -> None:

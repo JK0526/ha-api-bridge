@@ -65,6 +65,12 @@ async def test_auth_subscribe_delta_service_and_shutdown(
                 await asyncio.sleep(0.01)
         assert client.ha_version == "2026.10.0"
         assert client.states[ENTITY_ID]["state"] == "cool"
+        assert client.remote_temperature_unit == "°C"
+        assert [item["type"] for item in remote_ha.requests[:2]] == [
+            "get_config",
+            "subscribe_entities",
+        ]
+        assert sum(item["type"] == "get_config" for item in remote_ha.requests) == 1
         assert remote_ha.auth_messages == [{"type": "auth", "access_token": TOKEN}]
         assert len(remote_ha.sockets) == 1
         assert len(remote_ha.subscription_ids) == 1

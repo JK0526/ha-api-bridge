@@ -78,6 +78,7 @@ class MockRemoteHA:
         self.ignore_subscribe_response = False
         self.ignore_unsubscribe_response = False
         self.ignore_get_states = False
+        self.unit_system_temperature: str | None = "°C"
         self.invalid_get_states = False
         self.delay_connect = False
         self.connect_started = asyncio.Event()
@@ -150,7 +151,20 @@ async def remote_ha(
             payload = message.json()
             remote.requests.append(payload)
             command = payload["type"]
-            if command == "get_states":
+            if command == "get_config":
+                await ws.send_json(
+                    {
+                        "id": payload["id"],
+                        "type": "result",
+                        "success": True,
+                        "result": {
+                            "unit_system": {
+                                "temperature": remote.unit_system_temperature
+                            }
+                        },
+                    }
+                )
+            elif command == "get_states":
                 if remote.ignore_get_states:
                     continue
                 await ws.send_json(

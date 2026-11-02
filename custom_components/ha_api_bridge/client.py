@@ -113,6 +113,7 @@ class HAWebSocketClient:
         self._token = token
         self.entity_ids = tuple(entity_ids)
         self.ha_version: str | None = None
+        self.remote_temperature_unit: str | None = None
 
         self._session = async_get_clientsession(hass)
         self._ws: aiohttp.ClientWebSocketResponse | None = None
@@ -249,6 +250,7 @@ class HAWebSocketClient:
             self._stopping = False
             try:
                 await self.async_connect()
+                await self.async_get_config()
                 await self._subscribe()
                 if self._stopping:
                     raise RemoteConnectionError("Remote HA client is stopping")
@@ -276,6 +278,23 @@ class HAWebSocketClient:
         _LOGGER.debug(
             "Subscribed to %d selected Remote HA entities", len(self.entity_ids)
         )
+
+    async def async_get_config(self) -> None:
+        """Read Remote HA's unit system over the authenticated WebSocket."""
+        try:
+            result = await self._request({"type": "get_config"})
+        except (RemoteCommandError, RemoteRequestTimeout) as err:
+            _LOGGER.debug("Remote HA get_config could not be read: %s", err)
+            result = None
+
+        unit_system = result.get("unit_system") if isinstance(result, dict) else None
+        temperature = (
+            unit_system.get("temperature") if isinstance(unit_system, dict) else None
+        )
+        temperature_unit = temperature if isinstance(temperature, str) else None
+        if temperature_unit != self.remote_temperature_unit:
+            self.remote_temperature_unit = temperature_unit
+            self._notify_listeners()
 
     async def async_call_service(
         self, entity_id: str, service: str, service_data: dict[str, Any] | None = None
@@ -566,6 +585,7 @@ class HAWebSocketClient:
                 return
             try:
                 await self.async_connect()
+                await self.async_get_config()
                 await self._subscribe()
             except asyncio.CancelledError:
                 raise
