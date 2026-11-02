@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from homeassistant.components.climate import (
@@ -21,6 +22,8 @@ from .const import (
     CONF_ENTITY_IDS,
     CONF_INSTANCE_ID,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
@@ -230,9 +233,26 @@ class RemoteClimateEntity(ClimateEntity):
     @callback
     def _handle_update(self) -> None:
         self._sync_from_remote()
+        _LOGGER.debug("Proxy notification: entity_id=%s", self._remote_entity_id)
         if self.hass is None or self.entity_id is None:
             return
         self.async_write_ha_state()
+
+    @callback
+    def async_write_ha_state(self) -> None:
+        """Write the proxy state and log the mirrored Climate properties."""
+        _LOGGER.debug(
+            "Proxy write: entity_id=%s hvac_mode=%s temperature=%s "
+            "current_temperature=%s fan_mode=%s swing_mode=%s available=%s",
+            self._remote_entity_id,
+            self._client.redact_for_log(self.hvac_mode),
+            self._client.redact_for_log(self.target_temperature),
+            self._client.redact_for_log(self.current_temperature),
+            self._client.redact_for_log(self.fan_mode),
+            self._client.redact_for_log(self.swing_mode),
+            self._client.redact_for_log(self.available),
+        )
+        super().async_write_ha_state()
 
     async def async_will_remove_from_hass(self) -> None:
         """Drop the client listener when this proxy is removed."""
@@ -251,8 +271,11 @@ class RemoteClimateEntity(ClimateEntity):
         )
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
+        service_data = {
+            key: value for key, value in kwargs.items() if key != "entity_id"
+        }
         await self._client.async_call_service(
-            self._remote_entity_id, "set_temperature", kwargs
+            self._remote_entity_id, "set_temperature", service_data
         )
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:

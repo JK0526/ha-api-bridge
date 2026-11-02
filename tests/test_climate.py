@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 import pytest
@@ -44,6 +45,130 @@ def _proxy_state(hass: Any) -> Any:
         for state in states
         if state.attributes.get("friendly_name") == "Office AC"
     )
+
+
+async def test_remote_state_deltas_write_the_client_climate_state(
+    hass: Any,
+    remote_ha: MockRemoteHA,
+    enable_custom_integrations: None,
+) -> None:
+    """Real platform entities mirror 2026.10.3 compressed state deltas."""
+    await _create_platform_proxy(hass, remote_ha)
+    state = _proxy_state(hass)
+    assert state.state == "cool"
+    assert state.attributes["temperature"] == 25.0
+    assert state.attributes["current_temperature"] == 26.0
+    assert state.attributes["fan_mode"] == "auto"
+    assert state.attributes["swing_mode"] == "off"
+
+    subscription_id = remote_ha.subscription_ids[-1]
+    await remote_ha.send(
+        {
+            "id": subscription_id,
+            "type": "event",
+            "event": {"c": {ENTITY_ID: {"+": {"a": {"temperature": 24.0}}}}},
+        }
+    )
+    async with asyncio.timeout(1):
+        while _proxy_state(hass).attributes["temperature"] != 24.0:
+            await asyncio.sleep(0.01)
+
+    await remote_ha.send(
+        {
+            "id": subscription_id,
+            "type": "event",
+            "event": {"c": {ENTITY_ID: {"+": {"s": "heat"}}}},
+        }
+    )
+    async with asyncio.timeout(1):
+        while _proxy_state(hass).state != "heat":
+            await asyncio.sleep(0.01)
+
+    await remote_ha.send(
+        {
+            "id": subscription_id,
+            "type": "event",
+            "event": {
+                "c": {
+                    ENTITY_ID: {
+                        "+": {"a": {"fan_mode": "low", "swing_mode": "vertical"}},
+                        "-": {"a": ["preset_mode"]},
+                    }
+                }
+            },
+        }
+    )
+    async with asyncio.timeout(1):
+        while _proxy_state(hass).attributes["fan_mode"] != "low":
+            await asyncio.sleep(0.01)
+    final_state = _proxy_state(hass)
+    assert final_state.state == "heat"
+    assert final_state.attributes["temperature"] == 24.0
+    assert final_state.attributes["fan_mode"] == "low"
+    assert final_state.attributes["swing_mode"] == "vertical"
+    assert final_state.attributes["preset_mode"] is None
+
+
+async def test_client_command_waits_for_remote_subscribe_entities_update(
+    hass: Any,
+    remote_ha: MockRemoteHA,
+    enable_custom_integrations: None,
+) -> None:
+    """A successful command does not optimistically write the proxy state."""
+    remote_ha.states[0]["attributes"]["temperature"] = 24.0
+    await _create_platform_proxy(hass, remote_ha)
+    state = _proxy_state(hass)
+    assert state.attributes["temperature"] == 24.0
+
+    await hass.services.async_call(
+        "climate",
+        "set_temperature",
+        {"entity_id": state.entity_id, "temperature": 25.0},
+        blocking=True,
+    )
+    assert next(item for item in remote_ha.requests if item["type"] == "call_service")[
+        "service_data"
+    ] == {"temperature": 25.0}
+    assert _proxy_state(hass).attributes["temperature"] == 24.0
+
+    remote_ha.states[0]["attributes"]["temperature"] = 25.0
+    await remote_ha.send(
+        {
+            "id": remote_ha.subscription_ids[-1],
+            "type": "event",
+            "event": {"c": {ENTITY_ID: {"+": {"a": {"temperature": 25.0}}}}},
+        }
+    )
+    async with asyncio.timeout(1):
+        while _proxy_state(hass).attributes["temperature"] != 25.0:
+            await asyncio.sleep(0.01)
+
+
+async def test_debug_sync_diagnostics_redact_the_access_token(
+    hass: Any,
+    remote_ha: MockRemoteHA,
+    enable_custom_integrations: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Selected-entity DEBUG diagnostics never expose the access token."""
+    remote_ha.states[0]["attributes"]["fan_mode"] = TOKEN
+    caplog.set_level(logging.DEBUG)
+    await _create_platform_proxy(hass, remote_ha)
+
+    assert "RX subscribe_entities" in caplog.text
+    assert "Merged snapshot" in caplog.text
+    assert "Proxy write" in caplog.text
+    assert TOKEN not in caplog.text
+    diagnostic_records = [
+        record
+        for record in caplog.records
+        if any(
+            marker in record.getMessage()
+            for marker in ("RX subscribe_entities", "Merged snapshot", "Proxy write")
+        )
+    ]
+    assert diagnostic_records
+    assert all(record.levelno == logging.DEBUG for record in diagnostic_records)
 
 
 async def test_climate_mapping_and_non_optimistic_command(
@@ -135,7 +260,7 @@ async def test_unavailable_removed_and_unknown_states(
             {
                 "id": subscription_id,
                 "type": "event",
-                "event": {"c": {ENTITY_ID: {"s": "unknown"}}},
+                "event": {"c": {ENTITY_ID: {"+": {"s": "unknown"}}}},
             }
         )
         async with asyncio.timeout(1):
@@ -147,7 +272,7 @@ async def test_unavailable_removed_and_unknown_states(
             {
                 "id": subscription_id,
                 "type": "event",
-                "event": {"c": {ENTITY_ID: {"s": "unavailable"}}},
+                "event": {"c": {ENTITY_ID: {"+": {"s": "unavailable"}}}},
             }
         )
         async with asyncio.timeout(1):

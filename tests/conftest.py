@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from datetime import datetime
 from typing import Any
 
 import pytest
@@ -39,14 +40,25 @@ def climate_state() -> dict[str, Any]:
             "temperature_unit": "°C",
         },
         "last_changed": "2026-10-29T00:00:00+00:00",
-        "last_updated": "2026-10-29T00:00:00+00:00",
+        "last_updated": "2026-10-29T00:00:01+00:00",
         "context": {"id": "test-context", "parent_id": None, "user_id": None},
     }
 
 
 def compressed_state(state: dict[str, Any]) -> dict[str, Any]:
     """Encode the entity state as subscribe_entities does."""
-    return {"s": state["state"], "a": state["attributes"]}
+    context = state["context"]
+    if context.get("parent_id") is None and context.get("user_id") is None:
+        compressed_context: str | dict[str, Any] = context["id"]
+    else:
+        compressed_context = context
+    return {
+        "s": state["state"],
+        "a": state["attributes"],
+        "c": compressed_context,
+        "lc": datetime.fromisoformat(state["last_changed"]).timestamp(),
+        "lu": datetime.fromisoformat(state["last_updated"]).timestamp(),
+    }
 
 
 class MockRemoteHA:

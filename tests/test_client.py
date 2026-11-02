@@ -26,25 +26,29 @@ pytestmark = pytest.mark.enable_socket
 def test_websocket_url_conversion() -> None:
     assert websocket_url("http://ha.local:8123/") == "ws://ha.local:8123/api/websocket"
     assert (
+        websocket_url("192.168.1.118:8123") == "ws://192.168.1.118:8123/api/websocket"
+    )
+    assert (
         websocket_url("https://ha.example/home/")
         == "wss://ha.example/home/api/websocket"
     )
-    assert (
-        websocket_url("http://ha.local/api/websocket") == "ws://ha.local/api/websocket"
-    )
+    with pytest.raises(ValueError):
+        websocket_url("http://ha.local/api/websocket")
     with pytest.raises(ValueError):
         websocket_url("ftp://ha.local")
 
 
 def test_remote_url_normalization() -> None:
+    assert normalized_remote_url("192.168.1.118:8123") == "http://192.168.1.118:8123"
+    assert normalized_remote_url("HomeAssistant.Local:8123") == (
+        "http://homeassistant.local:8123"
+    )
     assert (
         normalized_remote_url("HTTP://HOMEASSISTANT.LOCAL:8123/")
         == "http://homeassistant.local:8123"
     )
-    assert (
+    with pytest.raises(ValueError):
         normalized_remote_url("http://homeassistant.local:8123/api/websocket/")
-        == "http://homeassistant.local:8123"
-    )
     assert normalized_remote_url("HTTP://HA.LOCAL:80/") == "http://ha.local"
     assert normalized_remote_url("HTTPS://HA.LOCAL:443") == "https://ha.local"
     assert normalized_remote_url("https://ha.local:8443/") == "https://ha.local:8443"
@@ -68,6 +72,9 @@ async def test_auth_subscribe_delta_service_and_shutdown(
             item for item in remote_ha.requests if item["type"] == "subscribe_entities"
         )
         assert subscribe["entity_ids"] == [ENTITY_ID]
+        assert client.states[ENTITY_ID]["context"] == "test-context"
+        assert client.states[ENTITY_ID]["last_changed"]
+        assert client.states[ENTITY_ID]["last_updated"]
 
         before = client.states[ENTITY_ID]["attributes"]["temperature"]
         await client.async_call_service(
@@ -88,10 +95,12 @@ async def test_auth_subscribe_delta_service_and_shutdown(
                 "event": {
                     "c": {
                         ENTITY_ID: {
-                            "a": {
-                                "+": {"temperature": 24, "fan_mode": "low"},
-                                "-": ["preset_mode", {}, []],
-                            }
+                            "+": {
+                                "a": {"temperature": 24, "fan_mode": "low"},
+                            },
+                            "-": {
+                                "a": ["preset_mode"],
+                            },
                         }
                     }
                 },
@@ -105,6 +114,112 @@ async def test_auth_subscribe_delta_service_and_shutdown(
         assert "preset_mode" not in client.states[ENTITY_ID]["attributes"]
         assert client.connected
     finally:
+        await client.async_close()
+
+
+async def test_ha_2026_10_subscribe_entities_payloads_merge_and_notify(
+    hass: Any, remote_ha: MockRemoteHA
+) -> None:
+    """Merge the wire shape emitted by HA 2026.10.3 and notify listeners."""
+    client = HAWebSocketClient(hass, remote_ha.url, TOKEN, [ENTITY_ID])
+    notifications: list[dict[str, Any]] = []
+    remove_listener = client.add_listener(
+        lambda: notifications.append(
+            {
+                "state": client.states.get(ENTITY_ID, {}).get("state"),
+                "attributes": dict(
+                    client.states.get(ENTITY_ID, {}).get("attributes", {})
+                ),
+            }
+        )
+    )
+    await client.async_start()
+    try:
+        async with asyncio.timeout(1):
+            while not client.synced:
+                await asyncio.sleep(0.01)
+        initial_notifications = len(notifications)
+        snapshot = client.states[ENTITY_ID]
+        assert snapshot["state"] == "cool"
+        assert snapshot["attributes"]["temperature"] == 25.0
+        assert snapshot["context"] == "test-context"
+        assert snapshot["last_changed"]
+        assert snapshot["last_updated"]
+
+        subscription_id = remote_ha.subscription_ids[0]
+        await remote_ha.send(
+            {
+                "id": subscription_id,
+                "type": "event",
+                "event": {
+                    "c": {
+                        ENTITY_ID: {
+                            "+": {"a": {"temperature": 24}},
+                        }
+                    }
+                },
+            }
+        )
+        async with asyncio.timeout(1):
+            while client.states[ENTITY_ID]["attributes"]["temperature"] != 24:
+                await asyncio.sleep(0.01)
+        assert len(notifications) == initial_notifications + 1
+
+        await remote_ha.send(
+            {
+                "id": subscription_id,
+                "type": "event",
+                "event": {
+                    "c": {
+                        ENTITY_ID: {
+                            "+": {
+                                "s": "heat",
+                                "c": {"id": "changed-context"},
+                                "lc": 1793232001.0,
+                            }
+                        }
+                    }
+                },
+            }
+        )
+        async with asyncio.timeout(1):
+            while client.states[ENTITY_ID]["state"] != "heat":
+                await asyncio.sleep(0.01)
+        assert client.states[ENTITY_ID]["context"] == {
+            "id": "changed-context",
+        }
+        assert notifications[-1]["state"] == "heat"
+
+        await remote_ha.send(
+            {
+                "id": subscription_id,
+                "type": "event",
+                "event": {
+                    "c": {
+                        ENTITY_ID: {
+                            "+": {
+                                "a": {
+                                    "fan_mode": "low",
+                                    "swing_mode": "vertical",
+                                    "current_temperature": 25.5,
+                                }
+                            },
+                            "-": {"a": ["preset_mode"]},
+                        }
+                    }
+                },
+            }
+        )
+        async with asyncio.timeout(1):
+            while client.states[ENTITY_ID]["attributes"].get("fan_mode") != "low":
+                await asyncio.sleep(0.01)
+        attributes = client.states[ENTITY_ID]["attributes"]
+        assert attributes["swing_mode"] == "vertical"
+        assert attributes["current_temperature"] == 25.5
+        assert "preset_mode" not in attributes
+        assert notifications[-1]["attributes"]["current_temperature"] == 25.5
+    finally:
+        remove_listener()
         await client.async_close()
 
     assert remote_ha.unsubscriptions == remote_ha.subscription_ids

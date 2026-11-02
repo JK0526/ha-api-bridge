@@ -63,7 +63,11 @@ def websocket_url(base_url: str) -> str:
 
 def normalized_remote_url(base_url: str) -> str:
     """Return a stable, credential-free HTTP(S) base URL for config identity."""
-    parsed = urlsplit(base_url.strip())
+    base_url = base_url.strip()
+    if "://" not in base_url:
+        base_url = f"http://{base_url}"
+
+    parsed = urlsplit(base_url)
     scheme = parsed.scheme.lower()
     if (
         scheme not in ("http", "https")
@@ -88,7 +92,9 @@ def normalized_remote_url(base_url: str) -> str:
 
     path = parsed.path.rstrip("/")
     if path.endswith("/api/websocket"):
-        path = path[: -len("/api/websocket")].rstrip("/")
+        raise ValueError(
+            "Enter the Remote Home Assistant base URL, not its WebSocket URL"
+        )
     return urlunsplit((scheme, netloc, path, "", ""))
 
 
@@ -148,6 +154,11 @@ class HAWebSocketClient:
             self._listeners.discard(listener)
 
         return remove_listener
+
+    def redact_for_log(self, value: Any) -> str:
+        """Return a string representation with the access token removed."""
+        text = str(value)
+        return text.replace(self._token, "[redacted]") if self._token else text
 
     async def async_connect(self) -> None:
         """Connect and authenticate without starting automatic reconnection."""
@@ -390,23 +401,35 @@ class HAWebSocketClient:
     def _apply_entities_event(self, event: dict[str, Any]) -> None:
         """Expand compact additions/deltas/removals into complete snapshots."""
         changed = not self._synced
+        touched_entities: set[str] = set()
         added = event.get("a")
         if isinstance(added, dict):
             for entity_id, compact in added.items():
+                self._log_entity_payload(entity_id, "a", compact)
                 if entity_id not in self.entity_ids or not isinstance(compact, dict):
                     continue
                 attributes = compact.get("a")
-                self._states[entity_id] = {
+                snapshot = {
                     ATTR_STATE: compact.get("s"),
                     ATTR_ATTRIBUTES: dict(attributes)
                     if isinstance(attributes, dict)
                     else {},
                 }
+                for compressed_key, state_key in (
+                    ("c", "context"),
+                    ("lc", "last_changed"),
+                    ("lu", "last_updated"),
+                ):
+                    if compressed_key in compact:
+                        snapshot[state_key] = compact[compressed_key]
+                self._states[entity_id] = snapshot
+                touched_entities.add(entity_id)
                 changed = True
 
         deltas = event.get("c")
         if isinstance(deltas, dict):
             for entity_id, delta in deltas.items():
+                self._log_entity_payload(entity_id, "c", delta)
                 snapshot = self._states.get(entity_id)
                 if (
                     entity_id not in self.entity_ids
@@ -414,34 +437,97 @@ class HAWebSocketClient:
                     or not isinstance(delta, dict)
                 ):
                     continue
-                if "s" in delta:
-                    snapshot[ATTR_STATE] = delta["s"]
-                attr_delta = delta.get("a")
-                if isinstance(attr_delta, dict):
-                    additions = attr_delta.get("+")
-                    if isinstance(additions, dict):
-                        snapshot[ATTR_ATTRIBUTES].update(additions)
-                    removed = attr_delta.get("-")
-                    if isinstance(removed, list):
-                        for attribute in removed:
+                additions = delta.get("+")
+                if isinstance(additions, dict):
+                    if "s" in additions:
+                        snapshot[ATTR_STATE] = additions["s"]
+                    for compressed_key, state_key in (
+                        ("lc", "last_changed"),
+                        ("lu", "last_updated"),
+                    ):
+                        if compressed_key in additions:
+                            snapshot[state_key] = additions[compressed_key]
+                    if "c" in additions:
+                        context = additions["c"]
+                        existing_context = snapshot.get("context")
+                        if isinstance(context, dict):
+                            merged_context = (
+                                {"id": existing_context}
+                                if isinstance(existing_context, str)
+                                else dict(existing_context)
+                                if isinstance(existing_context, dict)
+                                else {}
+                            )
+                            merged_context.update(context)
+                            snapshot["context"] = merged_context
+                        else:
+                            snapshot["context"] = context
+                    attribute_additions = additions.get("a")
+                    if isinstance(attribute_additions, dict):
+                        snapshot[ATTR_ATTRIBUTES].update(attribute_additions)
+
+                removals = delta.get("-")
+                if isinstance(removals, dict):
+                    removed_attributes = removals.get("a")
+                    if isinstance(removed_attributes, list):
+                        for attribute in removed_attributes:
                             if isinstance(attribute, str):
                                 snapshot[ATTR_ATTRIBUTES].pop(attribute, None)
-                    if "+" not in attr_delta and "-" not in attr_delta:
-                        snapshot[ATTR_ATTRIBUTES].update(attr_delta)
+
+                touched_entities.add(entity_id)
                 changed = True
 
         removed_ids = event.get("r")
         if isinstance(removed_ids, list):
             for entity_id in removed_ids:
+                self._log_entity_payload(entity_id, "r", [entity_id])
                 if (
                     entity_id in self.entity_ids
                     and self._states.pop(entity_id, None) is not None
                 ):
+                    touched_entities.add(entity_id)
                     changed = True
 
         self._synced = True
+        for entity_id in touched_entities:
+            snapshot = self._states.get(entity_id)
+            self._log_merged_snapshot(entity_id, snapshot)
         if changed:
             self._notify_listeners()
+
+    def _log_entity_payload(
+        self, entity_id: str, event_type: str, payload: Any
+    ) -> None:
+        """Log selected compressed payloads at DEBUG while redacting the token."""
+        if entity_id not in self.entity_ids or not _LOGGER.isEnabledFor(logging.DEBUG):
+            return
+        raw_payload = self.redact_for_log(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        )
+        _LOGGER.debug(
+            "RX subscribe_entities: entity_id=%s event type=%s "
+            "raw compressed entity payload=%s",
+            entity_id,
+            event_type,
+            raw_payload,
+        )
+
+    def _log_merged_snapshot(
+        self, entity_id: str, snapshot: dict[str, Any] | None
+    ) -> None:
+        """Log selected merged state and attributes at DEBUG."""
+        if not _LOGGER.isEnabledFor(logging.DEBUG):
+            return
+        state = snapshot.get(ATTR_STATE) if snapshot else None
+        attributes = snapshot.get(ATTR_ATTRIBUTES) if snapshot else None
+        raw_snapshot = self.redact_for_log(
+            json.dumps(
+                {"state": state, "attributes": attributes},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+        _LOGGER.debug("Merged snapshot: entity_id=%s %s", entity_id, raw_snapshot)
 
     def _notify_listeners(self) -> None:
         """Notify proxy entities without doing network I/O."""

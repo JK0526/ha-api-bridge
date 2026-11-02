@@ -7,6 +7,9 @@
         "data": {
           "url": "Remote Home Assistant URL",
           "token": "Long-Lived Access Token"
+        },
+        "data_description": {
+          "url": "Enter an IP address, hostname, or full http/https URL, for example 192.168.1.118:8123. If http/https is omitted, http:// is added automatically."
         }
       },
       "select_entities": {

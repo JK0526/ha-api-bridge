@@ -28,10 +28,12 @@ pytestmark = pytest.mark.enable_socket
 async def test_config_flow_auth_and_create_entry(
     hass: Any, remote_ha: MockRemoteHA, enable_custom_integrations: None
 ) -> None:
+    parsed_url = urlsplit(remote_ha.url)
+    url_without_scheme = parsed_url.netloc
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
         context={"source": SOURCE_USER},
-        data={CONF_URL: remote_ha.url, CONF_TOKEN: TOKEN},
+        data={CONF_URL: url_without_scheme, CONF_TOKEN: TOKEN},
     )
     assert result["type"] == "form"
     assert result["step_id"] == "select_entities"
@@ -58,8 +60,7 @@ async def test_config_flow_auth_and_create_entry(
     assert len(remote_ha.sockets) == 2
     assert len(remote_ha.subscription_ids) == 1
 
-    parsed_url = urlsplit(remote_ha.url)
-    duplicate_url = f"HTTP://{parsed_url.netloc.upper()}/api/websocket/"
+    duplicate_url = f"HTTP://{parsed_url.netloc.upper()}/"
     sockets_before_duplicate = len(remote_ha.sockets)
     duplicate = await hass.config_entries.flow.async_init(
         DOMAIN,
@@ -107,6 +108,15 @@ async def test_config_flow_reports_invalid_url(
     assert result["type"] == "form"
     assert result["step_id"] == "user"
     assert result["errors"] == {"base": "cannot_connect"}
+
+    endpoint = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_USER},
+        data={CONF_URL: "http://remote-ha.invalid/api/websocket", CONF_TOKEN: TOKEN},
+    )
+    assert endpoint["type"] == "form"
+    assert endpoint["step_id"] == "user"
+    assert endpoint["errors"] == {"base": "cannot_connect"}
 
 
 async def test_config_flow_connect_timeout_closes_temporary_client(
